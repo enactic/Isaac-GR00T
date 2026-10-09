@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 import json
 import logging
@@ -23,10 +25,14 @@ from transformers import AutoModel, AutoProcessor
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.data.camera_schema import CAMERA_IMAGE_PROFILES, DEFAULT_CAMERA_IMAGE_PROFILES
 from gr00t.data.dataset.factory import DatasetFactory
 from gr00t.model.base.model_pipeline import ModelPipeline
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
-from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import (
+    Gr00tN1d7Processor,
+    validate_action_horizons,
+)
 from gr00t.model.registry import register_model
 from gr00t.utils.dist_utils import run_or_wait_on_rank0
 
@@ -71,6 +77,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         return self.config.model
 
     def setup(self):
+        validate_action_horizons(
+            self.config.data.modality_configs, self.model_config.action_horizon
+        )
         self.model = self._create_model()
         self.train_dataset, self.eval_dataset = self._create_dataset(self.save_cfg_dir)
         self.data_collator = self._create_collator()
@@ -124,6 +133,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 self.config.model,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
+        self._apply_action_horizon(model)
 
         logging.debug(f"Model Config: {model.config}")
         with run_or_wait_on_rank0(label="final_model_config.json write") as is_rank0:
@@ -140,6 +150,19 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         logging.debug(f"Model architecture: {model}")
 
         return model
+
+    def _apply_action_horizon(self, model):
+        target_action_horizon = self.model_config.action_horizon
+        current_action_horizon = getattr(model.action_head, "action_horizon", None)
+        model.config.action_horizon = target_action_horizon
+        model.action_head.config.action_horizon = target_action_horizon
+        model.action_head.action_horizon = target_action_horizon
+        if current_action_horizon != target_action_horizon:
+            logging.info(
+                "Action horizon set from checkpoint/config value %s to %s",
+                current_action_horizon,
+                target_action_horizon,
+            )
 
     def _get_statistics(
         self,
@@ -173,6 +196,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 shortest_image_edge=self.model_config.shortest_image_edge,
                 crop_fraction=self.model_config.crop_fraction,
                 letter_box_transform=letter_box_transform,
+                camera_image_profiles=CAMERA_IMAGE_PROFILES,
+                default_camera_image_profile_by_embodiment=DEFAULT_CAMERA_IMAGE_PROFILES,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 use_alternate_vl_dit=self.model_config.use_alternate_vl_dit,
                 use_relative_action=self.model_config.use_relative_action,
@@ -204,6 +229,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 shortest_image_edge=self.model_config.shortest_image_edge,
                 crop_fraction=self.model_config.crop_fraction,
                 letter_box_transform=letter_box_transform,
+                camera_image_profiles=CAMERA_IMAGE_PROFILES,
+                default_camera_image_profile_by_embodiment=DEFAULT_CAMERA_IMAGE_PROFILES,
                 use_relative_action=self.model_config.use_relative_action,
                 # State augmentation
                 exclude_state=self.model_config.exclude_state,

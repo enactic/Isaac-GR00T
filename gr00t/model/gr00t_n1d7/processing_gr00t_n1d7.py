@@ -12,7 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
 import logging
@@ -24,6 +27,7 @@ from typing import Any, Dict
 import warnings
 
 import albumentations as A
+import cv2
 import numpy as np
 from PIL import Image
 import torch
@@ -40,6 +44,7 @@ from gr00t.data.utils import parse_modality_configs, to_json_serializable
 
 from .image_augmentations import (
     apply_with_replay,
+    build_camera_profile_transform,
     build_image_transformations,
     build_image_transformations_albumentations,
 )
@@ -74,6 +79,7 @@ _PROJECTOR_INDEX_GROUPS: dict[int, set[str]] = {
     # `new_embodiment`.
     10: {"new_embodiment", "robocasa_panda_omron", "robocasa_gr1_tabletop"},
     11: {"unitree_g1_sonic"},
+    12: {"openarm_bimanual_rel"},
     24: {"oxe_droid_relative_eef_relative_joint"},
     # Same G1 embodiment either side of the pretrain/posttrain boundary
     # (`real_g1_*` is pretrain, `unitree_g1_full_body_*` is posttrain).
@@ -244,6 +250,8 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Normalization
         use_mean_std: bool = False,
         letter_box_transform: bool = False,
+        camera_image_profiles: dict[str, dict] | None = None,
+        default_camera_image_profile_by_embodiment: dict[str, str] | None = None,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
 
@@ -270,6 +278,13 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.state_dropout_prob = state_dropout_prob
 
         self.letter_box_transform = letter_box_transform
+        self.camera_image_profiles = camera_image_profiles or {}
+        self.default_camera_image_profile_by_embodiment = (
+            default_camera_image_profile_by_embodiment or {}
+        )
+        self._camera_profile_transform_cache = {}
+        self._image_preprocess_workers = 1
+        self._image_preprocess_executor: ThreadPoolExecutor | None = None
 
         # Save VLM settings
         self.formalize_language = formalize_language
@@ -279,7 +294,6 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
         self.max_action_horizon = max_action_horizon
-        validate_action_horizons(self.modality_configs, self.max_action_horizon)
 
         # Save image processing settings
         self.image_crop_size = image_crop_size
@@ -333,6 +347,210 @@ class Gr00tN1d7Processor(BaseProcessor):
     @property
     def collator(self):
         return self._collator
+
+    @property
+    def image_preprocess_workers(self) -> int:
+        return self._image_preprocess_workers
+
+    def set_image_preprocess_workers(self, num_workers: int) -> None:
+        """Set eval camera-profile crop/resize parallelism for inference."""
+        num_workers = int(num_workers)
+        if num_workers <= 0:
+            raise ValueError("image preprocess workers must be > 0")
+        if num_workers == self._image_preprocess_workers:
+            return
+        self.close_image_preprocess_workers()
+        self._image_preprocess_workers = num_workers
+
+    def close_image_preprocess_workers(self) -> None:
+        executor = self._image_preprocess_executor
+        self._image_preprocess_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def _get_image_preprocess_executor(self) -> ThreadPoolExecutor | None:
+        if self._image_preprocess_workers <= 1:
+            return None
+        if self._image_preprocess_executor is None:
+            self._image_preprocess_executor = ThreadPoolExecutor(
+                max_workers=self._image_preprocess_workers,
+                thread_name_prefix="gr00t-image-preprocess",
+            )
+        return self._image_preprocess_executor
+
+    def _resolve_camera_image_profile(
+        self, embodiment_tag: EmbodimentTag | None
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        profile_name = None
+        if embodiment_tag is not None:
+            profile_name = self.default_camera_image_profile_by_embodiment.get(embodiment_tag.value)
+        if not profile_name:
+            return None, None
+        if profile_name not in self.camera_image_profiles:
+            raise ValueError(
+                f"Unknown camera_image_profile '{profile_name}' for embodiment "
+                f"'{embodiment_tag.value if embodiment_tag is not None else None}'. Available profiles: "
+                f"{', '.join(sorted(self.camera_image_profiles))}"
+            )
+        return profile_name, self.camera_image_profiles[profile_name]
+
+    def _get_camera_profile_transform(
+        self,
+        profile_name: str,
+        profile: dict[str, Any],
+        camera_name: str,
+    ) -> A.Compose:
+        cache_key = (bool(self.training), profile_name, camera_name)
+        if cache_key not in self._camera_profile_transform_cache:
+            camera_cfg = profile.get(camera_name)
+            if camera_cfg is None:
+                raise ValueError(
+                    f"camera_image_profile '{profile_name}' is missing camera '{camera_name}'"
+                )
+            self._camera_profile_transform_cache[cache_key] = build_camera_profile_transform(
+                camera_cfg,
+                training=self.training,
+                camera_name=camera_name,
+                color_jitter_params=self.color_jitter_params,
+            )
+        return self._camera_profile_transform_cache[cache_key]
+
+    def _apply_camera_profile_images(
+        self,
+        *,
+        profile_name: str,
+        profile: dict[str, Any],
+        image_keys: list[str],
+        images: dict[str, list[Any]],
+        masks: dict[str, list[np.ndarray]] | None = None,
+    ) -> list[Any]:
+        if not self.training and masks is None:
+            job_images = []
+            job_configs = []
+            for view in image_keys:
+                assert view in images, f"{view} not in {images}"
+                camera_cfg = profile.get(view)
+                if camera_cfg is None:
+                    raise ValueError(
+                        f"camera_image_profile '{profile_name}' is missing camera '{view}'"
+                    )
+                job_images.extend(images[view])
+                job_configs.extend([camera_cfg] * len(images[view]))
+
+            executor = self._get_image_preprocess_executor() if len(job_images) > 1 else None
+            if executor is None:
+                transformed_images = [
+                    self._fast_apply_eval_camera_profile_image(image, camera_cfg)
+                    for image, camera_cfg in zip(job_images, job_configs)
+                ]
+            else:
+                transformed_images = list(
+                    executor.map(
+                        self._fast_apply_eval_camera_profile_image,
+                        job_images,
+                        job_configs,
+                    )
+                )
+
+            if all(image is not None for image in transformed_images):
+                transformed_by_view = {}
+                offset = 0
+                for view in image_keys:
+                    view_length = len(images[view])
+                    transformed_by_view[view] = transformed_images[offset : offset + view_length]
+                    offset += view_length
+                num_timesteps = len(images[image_keys[0]])
+                return [
+                    transformed_by_view[view][t]
+                    for t in range(num_timesteps)
+                    for view in image_keys
+                ]
+
+        transformed_by_view = {}
+        for view in image_keys:
+            assert view in images, f"{view} not in {images}"
+            view_masks = masks.get(view) if masks else None
+            transform = self._get_camera_profile_transform(profile_name, profile, view)
+            transformed_by_view[view], _ = apply_with_replay(
+                transform,
+                images[view],
+                view_masks,
+            )
+
+        num_timesteps = len(images[image_keys[0]])
+        return [transformed_by_view[view][t] for t in range(num_timesteps) for view in image_keys]
+
+    def _fast_apply_eval_camera_profile_image(
+        self,
+        image: Any,
+        camera_cfg: dict[str, Any],
+    ) -> np.ndarray | None:
+        """Fast deterministic equivalent of source-crop-resize camera profiles."""
+        if not isinstance(camera_cfg, dict):
+            return None
+
+        if isinstance(image, torch.Tensor):
+            image = image.detach().cpu().numpy()
+        arr = np.asarray(image)
+        if arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[-1] != 3:
+            arr = np.transpose(arr, (1, 2, 0))
+        if arr.ndim != 3 or arr.shape[-1] != 3:
+            return None
+        arr = np.ascontiguousarray(arr)
+
+        crop_xyxy = camera_cfg.get("crop_xyxy")
+        if crop_xyxy is not None:
+            if len(crop_xyxy) != 4:
+                return None
+            height, width = arr.shape[:2]
+            x_min, y_min, x_max, y_max = [int(v) for v in crop_xyxy]
+            x_min = max(0, min(width, x_min))
+            x_max = max(0, min(width, x_max))
+            y_min = max(0, min(height, y_min))
+            y_max = max(0, min(height, y_max))
+            if x_max <= x_min or y_max <= y_min:
+                return None
+            arr = arr[y_min:y_max, x_min:x_max]
+
+        eval_cfg = camera_cfg.get("eval", {}) or {}
+        if not isinstance(eval_cfg, dict):
+            return None
+        source_crop_fraction = eval_cfg.get(
+            "source_crop_fraction",
+            camera_cfg.get("source_crop_fraction", 1.0),
+        )
+        if source_crop_fraction is not None:
+            crop_fraction = float(source_crop_fraction)
+            if not 0.0 < crop_fraction <= 1.0:
+                return None
+            height, width = arr.shape[:2]
+            crop_height = max(1, int(height * crop_fraction))
+            crop_width = max(1, int(width * crop_fraction))
+            y_min = (height - crop_height) // 2
+            x_min = (width - crop_width) // 2
+            arr = arr[y_min : y_min + crop_height, x_min : x_min + crop_width]
+
+        final_size = camera_cfg.get("final_size")
+        if final_size is None or len(final_size) != 2:
+            return None
+        final_height, final_width = [int(v) for v in final_size]
+        if final_height <= 0 or final_width <= 0:
+            return None
+        if arr.shape[:2] != (final_height, final_width):
+            arr = cv2.resize(
+                arr,
+                (final_width, final_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        return np.ascontiguousarray(arr)
+
+    def _to_qwen_image_input(self, image: Any) -> np.ndarray:
+        if isinstance(image, torch.Tensor):
+            image = image.detach().cpu().numpy()
+        image = np.asarray(image)
+        if image.ndim == 3 and image.shape[-1] == 3:
+            return np.ascontiguousarray(image)
+        return np.ascontiguousarray(np.transpose(image, (1, 2, 0)))
 
     def train(self):
         super().train()
@@ -543,22 +761,26 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         return BatchFeature(transformed_observation)
 
-    def _apply_vlm_processing(self, images: np.ndarray, language: str) -> BatchFeature:
+    def _apply_vlm_processing(self, images: Any, language: str) -> BatchFeature:
         """
         Args:
             batch:
-                video: [T, C, H, W]
+                video: list of HWC images or array [T, C, H, W]
         Returns: vlm_content format for collation
         """
-        # Convert images to PIL format
-        pil_images = [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in images]
+        if isinstance(images, (torch.Tensor, np.ndarray)):
+            # The ordinary path has CHW frames; convert them to PIL as upstream does.
+            qwen_images = [Image.fromarray(np.transpose(np.asarray(v), (1, 2, 0))) for v in images]
+        else:
+            # Camera profiles return a list, potentially with different view sizes.
+            qwen_images = [self._to_qwen_image_input(v) for v in images]
 
         # Create conversation with images and text
         conversation = [
             {
                 "role": "user",
                 "content": [
-                    *[{"type": "image", "image": img} for img in pil_images],
+                    *[{"type": "image", "image": img} for img in qwen_images],
                     {"type": "text", "text": language},
                 ],
             }
@@ -573,7 +795,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         return {
             "vlm_content": {
                 "text": text,
-                "images": pil_images,
+                "images": qwen_images,
                 "conversation": conversation,
             }
         }
@@ -687,6 +909,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             masks=content.masks,
             image_transform=image_transform,
             language=language,
+            embodiment_tag=embodiment_tag,
         )
 
         transformed_inputs = {
@@ -704,11 +927,24 @@ class Gr00tN1d7Processor(BaseProcessor):
     def _get_vlm_inputs(
         self,
         image_keys: list[str],
-        images: list[Image.Image],
+        images: dict[str, list[Any]],
         masks: dict[str, list[np.ndarray]] | None,
         image_transform: transforms.Compose | A.Compose,
         language: str,
+        embodiment_tag: EmbodimentTag | None = None,
     ):
+        profile_name, camera_profile = self._resolve_camera_image_profile(embodiment_tag)
+        if camera_profile is not None:
+            assert profile_name is not None
+            transformed_images = self._apply_camera_profile_images(
+                profile_name=profile_name,
+                profile=camera_profile,
+                image_keys=image_keys,
+                images=images,
+                masks=masks,
+            )
+            return self._apply_vlm_processing(transformed_images, language)
+
         temporal_stacked_images = {}
 
         if self.use_albumentations:
@@ -774,6 +1010,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "shortest_image_edge": self.shortest_image_edge,
                 "crop_fraction": self.crop_fraction,
                 "letter_box_transform": self.letter_box_transform,
+                "camera_image_profiles": self.camera_image_profiles,
+                "default_camera_image_profile_by_embodiment": (
+                    self.default_camera_image_profile_by_embodiment
+                ),
                 # VLM settings
                 "model_name": self.model_name,
                 "model_type": self.model_type,
@@ -861,6 +1101,15 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_name", "nvidia/Cosmos-Reason2-2B")
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
+        # Fields saved by earlier OpenArm checkpoints.
+        for key in (
+            "max_state_history_length",
+            "use_ndarray_vlm_images",
+            "state_noise_std",
+            "state_history_collapse_prob",
+            "image_history_collapse_prob",
+        ):
+            processor_kwargs.pop(key, None)
 
         # Directly override other processor kwargs
         if kwargs:
@@ -880,6 +1129,8 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_horizon",
                 "max_state_dim",
                 "max_action_dim",
+                "camera_image_profiles",
+                "default_camera_image_profile_by_embodiment",
             ]
             for key in override_keys:
                 if key in kwargs:

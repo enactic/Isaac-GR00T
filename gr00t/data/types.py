@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -98,9 +100,15 @@ class ModalityConfig:
     mean_std_embedding_keys: list[str] | None = None
     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
     action_configs: list[ActionConfig] | None = None
+    # Video only: missing optional views are black RGB frames at the source H,W.
+    optional_camera_shapes: dict[str, list[int]] | None = None
 
     def __post_init__(self):
         """Validate fields and set default values."""
+        if self.optional_camera_shapes:
+            for key, shape in self.optional_camera_shapes.items():
+                if key not in self.modality_keys or len(shape) != 2 or min(shape) <= 0:
+                    raise ValueError(f"Invalid optional camera shape for {key!r}: {shape}")
         if self.delta_indices is None or not isinstance(self.delta_indices, list):
             raise ValueError(f"delta_indices must be a non-None list, got {self.delta_indices!r}")
         if (

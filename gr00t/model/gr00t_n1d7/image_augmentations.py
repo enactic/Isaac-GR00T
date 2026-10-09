@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 from typing import Sequence
 import warnings
@@ -183,6 +185,56 @@ class BackgroundNoiseTransform(A.ImageOnlyTransform):
 
     def get_transform_init_args_names(self) -> tuple[str, ...]:
         return ("target_mask_values",)
+
+
+class FixedCropXYXY(A.DualTransform):
+    """Crop a fixed source-image box defined as [x1, y1, x2, y2]."""
+
+    def __init__(
+        self,
+        crop_xyxy: Sequence[int],
+        p: float = 1.0,
+        always_apply: bool | None = None,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        if len(crop_xyxy) != 4:
+            raise ValueError(f"crop_xyxy must have four values, got {crop_xyxy}")
+        self.crop_xyxy = tuple(int(v) for v in crop_xyxy)
+
+    def apply(
+        self, img: np.ndarray, crop_coords: tuple[int, int, int, int], **params
+    ) -> np.ndarray:
+        x_min, y_min, x_max, y_max = crop_coords
+        return img[y_min:y_max, x_min:x_max]
+
+    def apply_to_bboxes(
+        self, bboxes: np.ndarray, crop_coords: tuple[int, int, int, int], **params
+    ) -> np.ndarray:
+        return A.augmentations.crops.functional.crop_bboxes_by_coords(
+            bboxes, crop_coords, params["shape"]
+        )
+
+    def apply_to_keypoints(
+        self, keypoints: np.ndarray, crop_coords: tuple[int, int, int, int], **params
+    ) -> np.ndarray:
+        return A.augmentations.crops.functional.crop_keypoints_by_coords(keypoints, crop_coords)
+
+    def get_params_dependent_on_data(self, params, data) -> dict[str, tuple[int, int, int, int]]:
+        height, width = params["shape"][:2]
+        x_min, y_min, x_max, y_max = self.crop_xyxy
+        x_min = max(0, min(width, x_min))
+        x_max = max(0, min(width, x_max))
+        y_min = max(0, min(height, y_min))
+        y_max = max(0, min(height, y_max))
+        if x_max <= x_min or y_max <= y_min:
+            raise ValueError(
+                f"crop_xyxy {self.crop_xyxy} is empty after clipping to image size "
+                f"{(height, width)}"
+            )
+        return {"crop_coords": (x_min, y_min, x_max, y_max)}
+
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return ("crop_xyxy",)
 
 
 class FractionalRandomCrop(A.DualTransform):
@@ -490,6 +542,78 @@ def build_image_transformations_albumentations(
     eval_transform = A.Compose(eval_transform_list)
 
     return train_transform, eval_transform
+
+
+def build_camera_profile_transform(
+    camera_cfg: dict,
+    *,
+    training: bool,
+    camera_name: str = "",
+    color_jitter_params: dict[str, float] | None = None,
+) -> A.BasicTransform:
+    """Build the OpenArm source-crop-resize transform from a camera image profile."""
+    if not isinstance(camera_cfg, dict):
+        raise ValueError(f"Camera profile for '{camera_name}' must be a mapping")
+
+    transform_list = []
+
+    crop_xyxy = camera_cfg.get("crop_xyxy")
+    if crop_xyxy is not None:
+        transform_list.append(FixedCropXYXY(crop_xyxy))
+
+    mode_cfg = camera_cfg.get("train", {}) if training else camera_cfg.get("eval", {})
+    mode_cfg = mode_cfg or {}
+    if not isinstance(mode_cfg, dict):
+        raise ValueError(f"Camera profile mode block for '{camera_name}' must be a mapping")
+
+    source_crop_fraction = float(
+        mode_cfg.get("source_crop_fraction", camera_cfg.get("source_crop_fraction", 1.0))
+    )
+    if not 0.0 < source_crop_fraction <= 1.0:
+        raise ValueError(
+            f"source_crop_fraction must be in (0, 1] for '{camera_name}', "
+            f"got {source_crop_fraction}"
+        )
+    if source_crop_fraction < 1.0:
+        crop_transform = FractionalRandomCrop if training else FractionalCenterCrop
+        transform_list.append(crop_transform(crop_fraction=source_crop_fraction))
+
+    if training:
+        random_rotate_deg = mode_cfg.get("random_rotate_deg")
+        if random_rotate_deg is not None:
+            transform_list.append(
+                A.Rotate(
+                    limit=float(random_rotate_deg),
+                    p=float(mode_cfg.get("random_rotate_p", 1.0)),
+                )
+            )
+
+    final_size = camera_cfg.get("final_size")
+    if final_size is None or len(final_size) != 2:
+        raise ValueError(
+            f"Camera profile for '{camera_name}' must define final_size [height, width]"
+        )
+    final_h, final_w = [int(v) for v in final_size]
+    if final_h <= 0 or final_w <= 0:
+        raise ValueError(
+            f"final_size values must be positive for '{camera_name}', got {final_size}"
+        )
+    transform_list.append(A.Resize(height=final_h, width=final_w, interpolation=cv2.INTER_AREA))
+
+    if training and color_jitter_params is not None:
+        transform_list.append(
+            A.ColorJitter(
+                brightness=color_jitter_params.get("brightness", 0.0),
+                contrast=color_jitter_params.get("contrast", 0.0),
+                saturation=color_jitter_params.get("saturation", 0.0),
+                hue=color_jitter_params.get("hue", 0.0),
+                p=1.0,
+            )
+        )
+
+    if training:
+        return A.ReplayCompose(transform_list, p=1.0)
+    return A.Compose(transform_list, p=1.0)
 
 
 class LetterBoxTransform:

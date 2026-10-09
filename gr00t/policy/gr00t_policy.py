@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 """Gr00t Policy implementation for inference.
 
@@ -164,6 +166,13 @@ class Gr00tPolicy(BasePolicy):
             if k != "rl_info"
         }
         self.collate_fn = self.processor.collator
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import validate_action_horizons
+
+        max_action_horizon = getattr(self.processor, "max_action_horizon", None)
+        if max_action_horizon is not None:
+            validate_action_horizons(
+                {self.embodiment_tag.value: self.modality_configs}, max_action_horizon
+            )
 
         # Extract and validate language configuration
         # Some embodiments (e.g. OXE_DROID) define multiple language keys for
@@ -391,7 +400,7 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional parameters forwarded to model inference
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -414,7 +423,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units

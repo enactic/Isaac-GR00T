@@ -14,6 +14,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 """
 LeRobot Dataset Loader
@@ -42,6 +44,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from gr00t.data.camera_schema import complete_camera_frames
 from gr00t.data.types import ModalityConfig
 from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
 from gr00t.utils.video_utils import get_frames_by_indices
@@ -279,11 +282,13 @@ class LeRobotEpisodeLoader:
         # This handles the case where the model's pretrained config uses different
         # video key names than the dataset's modality.json (e.g., N1.6 vs N1.7 naming).
         self._video_key_mapping: dict[str, str] = {}
+        self._missing_video_keys: set[str] = set()
         if "video" in modality_configs and "video" in self.modality_meta:
             config_keys = modality_configs["video"].modality_keys
             meta_keys = list(self.modality_meta["video"].keys())
             needs_mapping = any(k not in self.modality_meta["video"] for k in config_keys)
-            if needs_mapping:
+            optional_shapes = modality_configs["video"].optional_camera_shapes or {}
+            if needs_mapping and not optional_shapes:
                 assert len(config_keys) == len(meta_keys), (
                     f"Cannot auto-map video keys: config has {len(config_keys)} keys "
                     f"{config_keys} but dataset modality meta has {len(meta_keys)} keys "
@@ -294,6 +299,21 @@ class LeRobotEpisodeLoader:
                 logging.warning(
                     f"Video key mismatch between model config and dataset. "
                     f"Auto-mapping by position: {self._video_key_mapping}"
+                )
+
+            for key in config_keys:
+                meta_key = self._video_key_mapping.get(key, key)
+                meta = self.modality_meta["video"].get(meta_key, {})
+                original_key = meta.get("original_key", f"observation.images.{meta_key}")
+                if original_key not in self.feature_config:
+                    if key not in optional_shapes:
+                        raise ValueError(f"Required camera {key!r} missing in {self.dataset_path}")
+                    self._missing_video_keys.add(key)
+            if self._missing_video_keys:
+                logging.warning(
+                    "Black camera slots in %s: %s",
+                    self.dataset_path,
+                    sorted(self._missing_video_keys),
                 )
 
         return modality_configs
@@ -420,11 +440,15 @@ class LeRobotEpisodeLoader:
         image_keys = self.modality_configs["video"].modality_keys
 
         for image_key in image_keys:
+            if image_key in self._missing_video_keys:
+                continue
             # Resolve the original key used in video file naming.
             # Use the video key mapping if the config key differs from the dataset meta key.
             meta_key = self._video_key_mapping.get(image_key, image_key)
-            original_key = self.modality_meta["video"][meta_key].get(
-                "original_key", f"observation.images.{meta_key}"
+            original_key = (
+                self.modality_meta["video"]
+                .get(meta_key, {})
+                .get("original_key", f"observation.images.{meta_key}")
             )
             assert original_key in self.feature_config, (
                 f"Original key {original_key} not found in feature config"
@@ -445,6 +469,10 @@ class LeRobotEpisodeLoader:
                 decoder_kwargs=self.decoder_kwargs or {},
             )
 
+        if self.modality_configs["video"].optional_camera_shapes:
+            return complete_camera_frames(
+                video_data, image_keys, self.modality_configs["video"].optional_camera_shapes
+            )
         return video_data
 
     def _load_mask_file(self, mask_path: Path, indices: np.ndarray) -> np.ndarray:

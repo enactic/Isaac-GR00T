@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
@@ -195,6 +197,10 @@ class FinetuneConfig:
     """If True, skip loading model weights from base_model_path (architecture only).
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
+    resume_base_ckpt_stats: bool = False
+    """Retain checkpoint normalization when starting a new fine-tuning stage."""
+    action_horizon: int | None = None
+    """Model action horizon. If None, use the model config default."""
 
     def __post_init__(self) -> None:
         if self.gradient_accumulation_steps < 1:

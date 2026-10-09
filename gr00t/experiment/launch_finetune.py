@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 # Launch finetuning for N1.7 on "single node".
 # This script tries to provide a similar user experience as current OSS.
@@ -100,6 +102,8 @@ if __name__ == "__main__":
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
+    if ft_config.action_horizon is not None:
+        config.model.action_horizon = ft_config.action_horizon
 
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
@@ -122,6 +126,7 @@ if __name__ == "__main__":
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
     config.data.ds_weights_alpha = ft_config.ds_weights_alpha
+    config.data.override_pretraining_statistics = not ft_config.resume_base_ckpt_stats
 
     config.training.save_only_model = ft_config.save_only_model
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint

@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 from enum import Enum
 
@@ -142,6 +144,10 @@ class EmbodimentTag(Enum):
     Uses the custom-embodiment finetuning projector slot.
     """
 
+    # History is a dataset-mix setting, not part of the tag.
+    OPENARM_BIMANUAL_REL = "openarm_bimanual_rel"
+    """16D bimanual joint actions: relative arms and absolute grippers."""
+
     @classmethod
     def resolve(cls, tag: "str | EmbodimentTag") -> "EmbodimentTag":
         """Resolve a string to an EmbodimentTag, case-insensitively.
@@ -217,6 +223,7 @@ POSTTRAIN_TAGS: frozenset[EmbodimentTag] = frozenset(
 FINETUNE_ONLY_TAGS: frozenset[EmbodimentTag] = frozenset(
     {
         EmbodimentTag.NEW_EMBODIMENT,
+        EmbodimentTag.OPENARM_BIMANUAL_REL,
         EmbodimentTag.ROBOCASA_PANDA_OMRON,
         EmbodimentTag.ROBOCASA_GR1_TABLETOP,
     }

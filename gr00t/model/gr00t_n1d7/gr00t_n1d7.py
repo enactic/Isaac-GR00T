@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modifications copyright 2026 Enactic, Inc. Modified for OpenArm support.
 
 import logging
 from typing import Any, Tuple
@@ -340,6 +342,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             state_features: [B, state_horizon, input_embedding_dim]
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
+            options: Optional runtime controls, e.g. denoising_steps or RTC settings.
         """
         vl_embeds = backbone_features
 
@@ -352,7 +355,15 @@ class Gr00tN1d7ActionHead(nn.Module):
             device=device,
         )
 
-        dt = 1.0 / self.num_inference_timesteps
+        num_inference_timesteps = self.num_inference_timesteps
+        if options is not None and "denoising_steps" in options:
+            num_inference_timesteps = int(options["denoising_steps"])
+            if num_inference_timesteps <= 0:
+                raise ValueError(
+                    f"denoising_steps must be a positive integer, got {num_inference_timesteps}"
+                )
+
+        dt = 1.0 / num_inference_timesteps
         vel_strength = torch.ones_like(actions)
 
         if "action" in action_input:
@@ -394,8 +405,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             ] = ramp[None, :, None].to(device)
 
         # Run denoising steps.
-        for t in range(self.num_inference_timesteps):
-            t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
+        for t in range(num_inference_timesteps):
+            t_cont = t / float(num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
 
             # Embed noised action trajectory.

@@ -14,6 +14,18 @@
   </p>
 </div>
 
+## OpenArm Extension
+
+This branch layers OpenArm training and inference support on the official N1.7
+main baseline. See the [training guide](examples/OpenArm/README.md) and the
+[OpenArm policy server](openarm_server/README.md), which serves the released
+`enactic/GR00T-N1.7-openarm-2-cell-pillow` checkpoint.
+The OpenArm additions and modifications are Copyright 2026 Enactic, Inc. and are
+licensed under the Apache License 2.0, like the rest of the code.
+
+The root dependency lock and official platform tooling are unchanged. OpenArm
+recipes use the shared fine-tuning entrypoint without requiring Slurm or containers.
+
 ## Table of Contents
 
 - [NVIDIA Isaac GR00T](#nvidia-isaac-gr00t)
